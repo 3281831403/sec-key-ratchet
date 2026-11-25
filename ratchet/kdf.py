@@ -51,6 +51,37 @@ PREFIX = b"GSB-RATCHET-v1"
 MAX_SKIP = 64
 CACHE_WINDOW = 8
 
+_MESSAGE_PREFIX = PREFIX + b"/message"
+
+
+def _check_key(key) -> None:
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise ValueError("key must be 32 bytes")
+
+
+def _check_domain(domain) -> None:
+    if not isinstance(domain, str) or not domain:
+        raise ValueError("domain must be a non-empty str")
+
+
+def _check_counter(counter, bits: int) -> None:
+    if not isinstance(counter, int) or isinstance(counter, bool):
+        raise ValueError("counter must be an int")
+    if counter < 0 or counter > 2**bits - 1:
+        raise ValueError("counter out of range")
+
+
+def _check_state(state) -> None:
+    if not isinstance(state, dict):
+        raise ValueError("state must be a mapping")
+    _check_key(state.get("chain_key"))
+    _check_domain(state.get("domain"))
+    counter = state.get("counter")
+    if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+        raise ValueError("state counter must be a non-negative int")
+    if not isinstance(state.get("cache"), dict):
+        raise ValueError("state cache must be a dict")
+
 
 def kdf_chain(key: bytes, counter: int, domain: str) -> bytes:
     """Derive one 32-byte chain key with explicit domain separation.
@@ -67,7 +98,17 @@ def kdf_chain(key: bytes, counter: int, domain: str) -> bytes:
     The result is always 32 bytes. Invalid arguments raise ValueError. The same
     arguments always return exactly the same bytes.
     """
-    raise NotImplementedError
+    _check_key(key)
+    _check_domain(domain)
+    _check_counter(counter, 64)
+    encoded = domain.encode("utf-8")
+    msg = (
+        PREFIX
+        + len(encoded).to_bytes(2, "big")
+        + encoded
+        + counter.to_bytes(8, "big")
+    )
+    return hmac.new(key, msg, hashlib.sha256).digest()
 
 
 def next_chain(state: dict) -> dict:
@@ -88,7 +129,17 @@ def next_chain(state: dict) -> dict:
     after a failed operation starts from the original chain rather than a
     partially advanced one.
     """
-    raise NotImplementedError
+    _check_state(state)
+    new_counter = state["counter"] + 1
+    new_chain_key = kdf_chain(
+        state["chain_key"], new_counter, state["domain"] + "/chain"
+    )
+    new_state = dict(state)
+    new_state["cache"] = dict(state["cache"])
+    new_state["chain_key"] = new_chain_key
+    new_state["counter"] = new_counter
+    new_state["message_key"] = message_key(new_chain_key, new_counter)
+    return new_state
 
 
 def skip_chain(state: dict, until: int) -> dict:
@@ -116,7 +167,32 @@ def skip_chain(state: dict, until: int) -> dict:
     message can still be decrypted later. Invalid until, an over-limit jump or
     a malformed state raises ValueError.
     """
-    raise NotImplementedError
+    _check_state(state)
+    if not isinstance(until, int) or isinstance(until, bool):
+        raise ValueError("until must be an int")
+    old_counter = state["counter"]
+    if until <= old_counter:
+        raise ValueError("until must be greater than the current counter")
+    steps = until - old_counter
+    if steps > MAX_SKIP:
+        raise ValueError("jump exceeds MAX_SKIP")
+
+    domain = state["domain"] + "/chain"
+    chain_key = state["chain_key"]
+    skipped = []
+    for c in range(old_counter + 1, until + 1):
+        chain_key = kdf_chain(chain_key, c, domain)
+        mk = message_key(chain_key, c)
+        if c < until:
+            skipped.append({"counter": c, "key": mk})
+
+    new_state = dict(state)
+    new_state["cache"] = dict(state["cache"])
+    new_state["chain_key"] = chain_key
+    new_state["counter"] = until
+    new_state["message_key"] = mk
+    new_state["skipped"] = skipped
+    return new_state
 
 
 def message_key(chain_key: bytes, counter: int) -> bytes:
@@ -130,7 +206,10 @@ def message_key(chain_key: bytes, counter: int) -> bytes:
     never be masked, wrapped or truncated. The same chain key and counter always
     return exactly the same bytes.
     """
-    raise NotImplementedError
+    _check_key(chain_key)
+    _check_counter(counter, 32)
+    msg = _MESSAGE_PREFIX + counter.to_bytes(4, "big")
+    return hmac.new(chain_key, msg, hashlib.sha256).digest()
 
 
 def cache_key(state: dict, counter: int, key: bytes) -> dict:
@@ -146,7 +225,17 @@ def cache_key(state: dict, counter: int, key: bytes) -> dict:
     The input state and its cache must not be modified. counter must be a
     non-negative int and key must be 32 bytes; invalid input raises ValueError.
     """
-    raise NotImplementedError
+    _check_state(state)
+    if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+        raise ValueError("counter must be a non-negative int")
+    _check_key(key)
+    new_cache = dict(state["cache"])
+    new_cache[counter] = key
+    while len(new_cache) > CACHE_WINDOW:
+        del new_cache[min(new_cache)]
+    new_state = dict(state)
+    new_state["cache"] = new_cache
+    return new_state
 
 
 def lookup_key(state: dict, counter: int) -> bytes:
@@ -158,7 +247,10 @@ def lookup_key(state: dict, counter: int) -> bytes:
     mutates only state["cache"]; the other state fields are left unchanged.
     A missing counter raises KeyError. Malformed input raises ValueError.
     """
-    raise NotImplementedError
+    _check_state(state)
+    if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+        raise ValueError("counter must be a non-negative int")
+    return state["cache"].pop(counter)
 
 
 def verify_chain_link(old: dict, new: dict, counter: int) -> bool:
@@ -177,7 +269,29 @@ def verify_chain_link(old: dict, new: dict, counter: int) -> bool:
     counter 2 cannot validate for counter 2. Malformed input returns False
     instead of raising. The function does not modify either mapping.
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            return False
+        old_key = old["chain_key"]
+        new_key = new["chain_key"]
+        old_domain = old["domain"]
+        new_domain = new["domain"]
+        if not isinstance(old_key, bytes) or not old_key:
+            return False
+        if not isinstance(new_key, bytes) or not new_key:
+            return False
+        if not isinstance(old_domain, str) or not old_domain:
+            return False
+        if not isinstance(new_domain, str) or not new_domain:
+            return False
+        if old_domain != new_domain:
+            return False
+        if old["counter"] != counter - 1 or new["counter"] != counter:
+            return False
+        expected = kdf_chain(old_key, counter, old_domain + "/chain")
+        return hmac.compare_digest(new_key, expected)
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def ratchet_batch(events: list, policy: dict) -> dict:
@@ -199,4 +313,41 @@ def ratchet_batch(events: list, policy: dict) -> dict:
     session to the final state produced by applying next_chain steps times.
     Input states are not modified. Empty events returns an empty dict.
     """
-    raise NotImplementedError
+    if not isinstance(policy, dict):
+        raise ValueError("policy must be a mapping")
+    max_steps = policy.get("max_steps")
+    if (
+        not isinstance(max_steps, int)
+        or isinstance(max_steps, bool)
+        or max_steps <= 0
+    ):
+        raise ValueError("policy max_steps must be a positive int")
+    if not isinstance(events, (list, tuple)):
+        raise ValueError("events must be a sequence")
+
+    result = {}
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("event must be a mapping")
+        if "session" not in event or "state" not in event or "steps" not in event:
+            raise ValueError("event missing a required field")
+        session = event["session"]
+        state = event["state"]
+        steps = event["steps"]
+        if session in result:
+            raise ValueError("duplicate session")
+        if (
+            not isinstance(steps, int)
+            or isinstance(steps, bool)
+            or steps < 0
+        ):
+            raise ValueError("steps must be a non-negative int")
+        if steps > max_steps:
+            raise ValueError("steps above max_steps")
+        _check_state(state)
+
+        current = state
+        for _ in range(steps):
+            current = next_chain(current)
+        result[session] = current
+    return result
